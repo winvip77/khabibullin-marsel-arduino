@@ -1,0 +1,1217 @@
+// =============================================================================
+// DRIVER SYSTEM + SERVICE MODE — полный код в одном файле
+// Arduino UNO/Nano | LiquidCrystal_I2C | MQ-3 | IR | Relay | LEDs | Buzzer
+//
+// Использование: скопировать в Arduino IDE как driver_system.ino (один файл)
+// Библиотека: LiquidCrystal I2C (адрес LCD 0x27)
+//
+// Service Mode — вход только во время прогрева MQ3:
+//   Пароль: TEST(1) RESET(2) START(3) RESET(2) TEST(1)
+//   Выход: пункт меню >EXIT SERVICE (START)
+// =============================================================================
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// =============================================================================
+// SERVICE MODE — константы и настройки
+// =============================================================================
+
+#define SVC_BTN_TEST  1
+#define SVC_BTN_RESET 2
+#define SVC_BTN_START 3
+
+#define SVC_PASSWORD_LEN      5
+#define SVC_INPUT_BUFFER_MAX  12
+
+#define SVC_DEBOUNCE_MS        50
+#define SVC_PRESS_TIMEOUT_MS   3000
+#define SVC_THRESHOLD_MIN  0
+#define SVC_THRESHOLD_MAX  1023
+
+#define SVC_WARMUP_MIN_MS    5000
+#define SVC_WARMUP_MAX_MS    120000
+#define SVC_WARMUP_STEP_MS   1000
+
+int level1 = 170;
+int level2 = 340;
+int level3 = 510;
+int level4 = 680;
+int level5 = 850;
+int alcoholLimit = 680;
+
+unsigned long mqWarmupTime = 10000;
+
+bool svcMq3Enabled = true;
+bool svcIrEnabled = true;
+bool svcLedEnabled = true;
+bool svcBuzzerEnabled = true;
+
+static const uint8_t SVC_PASSWORD[SVC_PASSWORD_LEN] = {
+  SVC_BTN_TEST, SVC_BTN_RESET, SVC_BTN_START, SVC_BTN_RESET, SVC_BTN_TEST
+};
+
+static LiquidCrystal_I2C *svcLcd = nullptr;
+
+static int svcPinTest = 8;
+static int svcPinReset = 9;
+static int svcPinStart = 10;
+static int svcPinEngineRelay = 5;
+static int svcPinIr = 2;
+static int svcPinBuzzer = 3;
+static int svcPinMq3 = A0;
+static int svcPinLed1 = 7;
+static int svcPinLed2 = 11;
+static int svcPinLed3 = 12;
+static int svcPinLed4 = 13;
+static int svcPinLed5 = 4;
+static int svcPinLed6 = A1;
+
+static bool serviceActive = false;
+
+static uint8_t entryBuffer[SVC_INPUT_BUFFER_MAX];
+static uint8_t entryCount = 0;
+static unsigned long entryLastPressMs = 0;
+
+static bool svcLastTest = HIGH;
+static bool svcLastReset = HIGH;
+static bool svcLastStart = HIGH;
+
+enum ServiceScreen {
+  SCR_ENGINE = 0,
+  SCR_IR,
+  SCR_MQ3_ROOT,
+  SCR_LED,
+  SCR_BUZZER,
+  SCR_EXIT,
+  SCR_COUNT
+};
+
+enum Mq3SubScreen {
+  MQ3_ENABLE = 0,
+  MQ3_LEVEL1,
+  MQ3_LEVEL2,
+  MQ3_LEVEL3,
+  MQ3_LEVEL4,
+  MQ3_LEVEL5,
+  MQ3_WARMUP,
+  MQ3_BACK,
+  MQ3_SUB_COUNT
+};
+
+enum ServiceUiState {
+  UI_MENU,
+  UI_MQ3_MENU,
+  UI_EDIT_BOOL,
+  UI_EDIT_THRESHOLD,
+  UI_EDIT_WARMUP
+};
+
+static ServiceUiState uiState = UI_MENU;
+static int menuIndex = 0;
+static int mq3SubIndex = 0;
+static int editingLevelIndex = 0;
+static bool displayDirty = true;
+static bool svcEngineRelayOn = false;
+
+// Service Mode — прототипы
+void serviceModeBindHardware(
+  LiquidCrystal_I2C *lcdPtr,
+  int pinTest, int pinReset, int pinStart,
+  int pinEngineRelay, int pinIr, int pinBuzzer, int pinMq3,
+  int pinLed1, int pinLed2, int pinLed3, int pinLed4, int pinLed5, int pinLed6
+);
+bool serviceModeIsActive();
+bool serviceModePollWarmupEntry(unsigned long warmupElapsedMs, unsigned long warmupTotalMs);
+void serviceModePollWarmupEntryNonBlocking(unsigned long warmupElapsedMs, unsigned long warmupTotalMs);
+
+static bool svcReadButtonPressed(int pin, bool &lastStable);
+static void svcResetSeqBuffer(uint8_t *buf, uint8_t &count);
+static bool svcAppendSeqDigit(uint8_t *buf, uint8_t &count, uint8_t digit, uint8_t maxLen);
+static bool svcSequenceMatches(const uint8_t *buf, uint8_t count, const uint8_t *pattern, uint8_t patternLen);
+static void svcSyncAlcoholLimit();
+static void svcEnforceThresholdOrder();
+static int svcClampThreshold(int value);
+static int svcGetThresholdByIndex(int idx);
+static void svcSetThresholdByIndex(int idx, int value);
+static void serviceModeEnter();
+static void serviceModeExit();
+static void serviceModeLoop();
+static void svcDrawDisplay();
+static void svcOnMenuButton(int btn);
+static void svcAllLedsOff();
+static void svcPrintLcdLine(uint8_t row, const char *text);
+static void svcToggleEngineRelay();
+static void svcToggleCurrentMenuBool();
+static void svcRedrawNow();
+static void svcFormatOnOff(char *buf, size_t bufLen, const char *label, bool enabled);
+static unsigned long svcClampWarmup(unsigned long ms);
+
+// =============================================================================
+// ОСНОВНОЙ ПРОЕКТ — пины
+// =============================================================================
+
+const int mq3Pin = A0;
+const int irPin = 2;
+
+const int buzzer = 3;
+const int engineRelay = 5;
+
+const int led1 = 7;
+const int led2 = 11;
+const int led3 = 12;
+const int led4 = 13;
+const int led5 = 4;
+const int led6 = A1;
+
+const int testButton = 8;
+const int resetButton = 9;
+const int startButton = 10;
+
+const unsigned long sleepOffTime = 10000;
+const unsigned long alcoholOffTime = 15000;
+
+unsigned long sleepStart = 0;
+unsigned long alcoholStart = 0;
+
+bool engineRunning = false;
+bool sleepDetected = false;
+bool alcoholDetected = false;
+
+bool lastStartButtonState = HIGH;
+
+// Основной проект — прототипы
+void systemTest();
+void warmupMQ3();
+void waitTestButton();
+void alcoholCheck();
+void showAlcoholLevel(int value);
+void allOff();
+void resetSystem();
+void handleStartStop();
+void runningAlarm();
+void emergencyShutdown(String reason);
+
+// =============================================================================
+// SERVICE MODE — реализация
+// =============================================================================
+
+void serviceModeBindHardware(
+  LiquidCrystal_I2C *lcdPtr,
+  int pTest, int pReset, int pStart,
+  int pRelay, int pIr, int pBuzzer, int pMq3,
+  int pL1, int pL2, int pL3, int pL4, int pL5, int pL6
+) {
+  svcLcd = lcdPtr;
+  svcPinTest = pTest;
+  svcPinReset = pReset;
+  svcPinStart = pStart;
+  svcPinEngineRelay = pRelay;
+  svcPinIr = pIr;
+  svcPinBuzzer = pBuzzer;
+  svcPinMq3 = pMq3;
+  svcPinLed1 = pL1;
+  svcPinLed2 = pL2;
+  svcPinLed3 = pL3;
+  svcPinLed4 = pL4;
+  svcPinLed5 = pL5;
+  svcPinLed6 = pL6;
+
+  svcLastTest = digitalRead(svcPinTest);
+  svcLastReset = digitalRead(svcPinReset);
+  svcLastStart = digitalRead(svcPinStart);
+
+  svcSyncAlcoholLimit();
+}
+
+bool serviceModeIsActive() {
+  return serviceActive;
+}
+
+bool serviceModePollWarmupEntry(unsigned long warmupElapsedMs, unsigned long warmupTotalMs) {
+  if (serviceActive) {
+    return true;
+  }
+
+  serviceModePollWarmupEntryNonBlocking(warmupElapsedMs, warmupTotalMs);
+
+  if (serviceActive) {
+    serviceModeLoop();
+    return true;
+  }
+
+  return false;
+}
+
+void serviceModePollWarmupEntryNonBlocking(unsigned long warmupElapsedMs, unsigned long warmupTotalMs) {
+  if (serviceActive) {
+    return;
+  }
+
+  if (warmupElapsedMs >= warmupTotalMs) {
+    svcResetSeqBuffer(entryBuffer, entryCount);
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (entryCount > 0 && (now - entryLastPressMs) > SVC_PRESS_TIMEOUT_MS) {
+    svcResetSeqBuffer(entryBuffer, entryCount);
+  }
+
+  int btn = 0;
+
+  if (svcReadButtonPressed(svcPinTest, svcLastTest)) {
+    btn = SVC_BTN_TEST;
+  } else if (svcReadButtonPressed(svcPinReset, svcLastReset)) {
+    btn = SVC_BTN_RESET;
+  } else if (svcReadButtonPressed(svcPinStart, svcLastStart)) {
+    btn = SVC_BTN_START;
+  }
+
+  if (btn != 0) {
+    entryLastPressMs = now;
+    svcAppendSeqDigit(entryBuffer, entryCount, (uint8_t)btn, SVC_INPUT_BUFFER_MAX);
+
+    if (svcSequenceMatches(entryBuffer, entryCount, SVC_PASSWORD, SVC_PASSWORD_LEN)) {
+      serviceModeEnter();
+    }
+  }
+}
+
+static bool svcReadButtonPressed(int pin, bool &lastStable) {
+  bool reading = digitalRead(pin);
+
+  if (reading != lastStable) {
+    delay(SVC_DEBOUNCE_MS);
+    reading = digitalRead(pin);
+    lastStable = reading;
+  }
+
+  if (reading == LOW) {
+    while (digitalRead(pin) == LOW) {
+      delay(1);
+    }
+    delay(SVC_DEBOUNCE_MS);
+    lastStable = HIGH;
+    return true;
+  }
+
+  return false;
+}
+
+static void svcResetSeqBuffer(uint8_t *buf, uint8_t &count) {
+  count = 0;
+  for (uint8_t i = 0; i < SVC_INPUT_BUFFER_MAX; i++) {
+    buf[i] = 0;
+  }
+}
+
+static bool svcAppendSeqDigit(uint8_t *buf, uint8_t &count, uint8_t digit, uint8_t maxLen) {
+  if (count >= maxLen) {
+    svcResetSeqBuffer(buf, count);
+  }
+
+  buf[count++] = digit;
+
+  if (count > SVC_PASSWORD_LEN) {
+    uint8_t shift = count - SVC_PASSWORD_LEN;
+    for (uint8_t i = 0; i < SVC_PASSWORD_LEN; i++) {
+      buf[i] = buf[shift + i];
+    }
+    count = SVC_PASSWORD_LEN;
+  }
+
+  return true;
+}
+
+static bool svcSequenceMatches(const uint8_t *buf, uint8_t count, const uint8_t *pattern, uint8_t patternLen) {
+  if (count < patternLen) {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < patternLen; i++) {
+    if (buf[count - patternLen + i] != pattern[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static int svcClampThreshold(int value) {
+  if (value < SVC_THRESHOLD_MIN) return SVC_THRESHOLD_MIN;
+  if (value > SVC_THRESHOLD_MAX) return SVC_THRESHOLD_MAX;
+  return value;
+}
+
+static void svcSyncAlcoholLimit() {
+  alcoholLimit = level4;
+}
+
+static void svcEnforceThresholdOrder() {
+  int *levels[5] = { &level1, &level2, &level3, &level4, &level5 };
+
+  for (int i = 0; i < 5; i++) {
+    *levels[i] = svcClampThreshold(*levels[i]);
+  }
+
+  for (int i = 1; i < 5; i++) {
+    if (*levels[i] < *levels[i - 1]) {
+      *levels[i] = *levels[i - 1];
+    }
+  }
+
+  svcSyncAlcoholLimit();
+}
+
+static int svcGetThresholdByIndex(int idx) {
+  switch (idx) {
+    case 0: return level1;
+    case 1: return level2;
+    case 2: return level3;
+    case 3: return level4;
+    case 4: return level5;
+    default: return 0;
+  }
+}
+
+static void svcSetThresholdByIndex(int idx, int value) {
+  switch (idx) {
+    case 0: level1 = svcClampThreshold(value); break;
+    case 1: level2 = svcClampThreshold(value); break;
+    case 2: level3 = svcClampThreshold(value); break;
+    case 3: level4 = svcClampThreshold(value); break;
+    case 4: level5 = svcClampThreshold(value); break;
+    default: break;
+  }
+  svcEnforceThresholdOrder();
+}
+
+static void svcAllLedsOff() {
+  digitalWrite(svcPinLed1, LOW);
+  digitalWrite(svcPinLed2, LOW);
+  digitalWrite(svcPinLed3, LOW);
+  digitalWrite(svcPinLed4, LOW);
+  digitalWrite(svcPinLed5, LOW);
+  digitalWrite(svcPinLed6, LOW);
+}
+
+static void svcPrintLcdLine(uint8_t row, const char *text) {
+  if (!svcLcd) return;
+  svcLcd->setCursor(0, row);
+  for (int i = 0; i < 16; i++) svcLcd->print(' ');
+  svcLcd->setCursor(0, row);
+  svcLcd->print(text);
+}
+
+static void svcFormatOnOff(char *buf, size_t bufLen, const char *label, bool enabled) {
+  snprintf(buf, bufLen, "%s: %s", label, enabled ? "ON " : "OFF");
+}
+
+static unsigned long svcClampWarmup(unsigned long ms) {
+  if (ms < SVC_WARMUP_MIN_MS) return SVC_WARMUP_MIN_MS;
+  if (ms > SVC_WARMUP_MAX_MS) return SVC_WARMUP_MAX_MS;
+  return ms;
+}
+
+static void svcRedrawNow() {
+  svcDrawDisplay();
+  displayDirty = false;
+}
+
+static void serviceModeEnter() {
+  serviceActive = true;
+  svcResetSeqBuffer(entryBuffer, entryCount);
+
+  uiState = UI_MENU;
+  menuIndex = 0;
+  mq3SubIndex = 0;
+  displayDirty = true;
+
+  svcEngineRelayOn = (digitalRead(svcPinEngineRelay) == HIGH);
+
+  if (svcLcd) {
+    svcLcd->clear();
+    svcPrintLcdLine(0, "SERVICE MODE");
+    svcPrintLcdLine(1, "Entering...");
+    delay(400);
+    svcLcd->clear();
+  }
+
+  svcAllLedsOff();
+  digitalWrite(svcPinBuzzer, LOW);
+}
+
+static void serviceModeExit() {
+  serviceActive = false;
+  svcResetSeqBuffer(entryBuffer, entryCount);
+
+  svcAllLedsOff();
+  digitalWrite(svcPinBuzzer, LOW);
+
+  if (!svcEngineRelayOn) {
+    digitalWrite(svcPinEngineRelay, LOW);
+  }
+
+  svcEnforceThresholdOrder();
+
+  if (svcLcd) {
+    svcLcd->clear();
+  }
+}
+
+static void svcDrawDisplay() {
+  if (!svcLcd) return;
+
+  char line0[17];
+  char line1[17];
+
+  if (uiState == UI_MENU) {
+    switch (menuIndex) {
+      case SCR_ENGINE:
+        snprintf(line0, 17, ">ENGINE");
+        svcFormatOnOff(line1, 17, "ENGINE", svcEngineRelayOn);
+        break;
+      case SCR_IR:
+        snprintf(line0, 17, ">IR SENSOR");
+        svcFormatOnOff(line1, 17, "IR", svcIrEnabled);
+        break;
+      case SCR_MQ3_ROOT:
+        snprintf(line0, 17, ">MQ3 SETTINGS");
+        snprintf(line1, 17, "W:%2lus L1:%4d", mqWarmupTime / 1000, level1);
+        break;
+      case SCR_LED:
+        snprintf(line0, 17, ">LED");
+        svcFormatOnOff(line1, 17, "LED", svcLedEnabled);
+        break;
+      case SCR_BUZZER:
+        snprintf(line0, 17, ">BUZZER");
+        svcFormatOnOff(line1, 17, "BUZZ", svcBuzzerEnabled);
+        break;
+      case SCR_EXIT:
+        snprintf(line0, 17, ">EXIT SERVICE");
+        snprintf(line1, 17, "S=confirm");
+        break;
+      default:
+        snprintf(line0, 17, "SERVICE MODE");
+        snprintf(line1, 17, "T^ Rv S=sel");
+        break;
+    }
+    svcPrintLcdLine(0, line0);
+    svcPrintLcdLine(1, line1);
+
+  } else if (uiState == UI_MQ3_MENU) {
+    switch (mq3SubIndex) {
+      case MQ3_ENABLE:
+        snprintf(line0, 17, ">MQ3 ENABLE");
+        svcFormatOnOff(line1, 17, "MQ3", svcMq3Enabled);
+        break;
+      case MQ3_LEVEL1:
+        snprintf(line0, 17, ">LEVEL 1");
+        snprintf(line1, 17, "L1: %4d", level1);
+        break;
+      case MQ3_LEVEL2:
+        snprintf(line0, 17, ">LEVEL 2");
+        snprintf(line1, 17, "L2: %4d", level2);
+        break;
+      case MQ3_LEVEL3:
+        snprintf(line0, 17, ">LEVEL 3");
+        snprintf(line1, 17, "L3: %4d", level3);
+        break;
+      case MQ3_LEVEL4:
+        snprintf(line0, 17, ">LEVEL 4");
+        snprintf(line1, 17, "L4: %4d", level4);
+        break;
+      case MQ3_LEVEL5:
+        snprintf(line0, 17, ">LEVEL 5");
+        snprintf(line1, 17, "L5: %4d", level5);
+        break;
+      case MQ3_WARMUP:
+        snprintf(line0, 17, ">WARMUP TIME");
+        snprintf(line1, 17, "Time: %2lus", mqWarmupTime / 1000);
+        break;
+      case MQ3_BACK:
+        snprintf(line0, 17, ">BACK");
+        snprintf(line1, 17, "S=main menu");
+        break;
+      default:
+        snprintf(line0, 17, "MQ3 MENU");
+        snprintf(line1, 17, "T^ Rv S=edit");
+        break;
+    }
+    svcPrintLcdLine(0, line0);
+    svcPrintLcdLine(1, line1);
+
+  } else if (uiState == UI_EDIT_BOOL) {
+    svcPrintLcdLine(0, ">MQ3 ENABLE");
+    svcFormatOnOff(line1, 17, "MQ3", svcMq3Enabled);
+
+  } else if (uiState == UI_EDIT_THRESHOLD) {
+    snprintf(line0, 17, ">EDIT LEVEL %d", editingLevelIndex + 1);
+    snprintf(line1, 17, "L%d: %4d", editingLevelIndex + 1, svcGetThresholdByIndex(editingLevelIndex));
+    svcPrintLcdLine(0, line0);
+    svcPrintLcdLine(1, line1);
+
+  } else if (uiState == UI_EDIT_WARMUP) {
+    svcPrintLcdLine(0, ">EDIT WARMUP");
+    snprintf(line1, 17, "Time: %2lus", mqWarmupTime / 1000);
+    svcPrintLcdLine(1, line1);
+  }
+}
+
+static void svcToggleEngineRelay() {
+  svcEngineRelayOn = !svcEngineRelayOn;
+  digitalWrite(svcPinEngineRelay, svcEngineRelayOn ? HIGH : LOW);
+  displayDirty = true;
+}
+
+static void svcToggleCurrentMenuBool() {
+  switch (menuIndex) {
+    case SCR_ENGINE:
+      svcToggleEngineRelay();
+      break;
+    case SCR_IR:
+      svcIrEnabled = !svcIrEnabled;
+      displayDirty = true;
+      break;
+    case SCR_LED:
+      svcLedEnabled = !svcLedEnabled;
+      if (!svcLedEnabled) svcAllLedsOff();
+      displayDirty = true;
+      break;
+    case SCR_BUZZER:
+      svcBuzzerEnabled = !svcBuzzerEnabled;
+      if (!svcBuzzerEnabled) digitalWrite(svcPinBuzzer, LOW);
+      displayDirty = true;
+      break;
+    default:
+      break;
+  }
+}
+
+static void svcOnMenuButton(int btn) {
+  if (uiState == UI_EDIT_BOOL) {
+    if (btn == SVC_BTN_TEST) {
+      svcMq3Enabled = !svcMq3Enabled;
+    } else if (btn == SVC_BTN_START) {
+      uiState = UI_MQ3_MENU;
+    }
+    svcRedrawNow();
+    return;
+  }
+
+  if (uiState == UI_EDIT_WARMUP) {
+    if (btn == SVC_BTN_TEST) {
+      mqWarmupTime = svcClampWarmup(mqWarmupTime + SVC_WARMUP_STEP_MS);
+    } else if (btn == SVC_BTN_RESET) {
+      mqWarmupTime = svcClampWarmup(mqWarmupTime - SVC_WARMUP_STEP_MS);
+    } else if (btn == SVC_BTN_START) {
+      uiState = UI_MQ3_MENU;
+    }
+    svcRedrawNow();
+    return;
+  }
+
+  if (uiState == UI_EDIT_THRESHOLD) {
+    if (btn == SVC_BTN_TEST) {
+      svcSetThresholdByIndex(editingLevelIndex, svcGetThresholdByIndex(editingLevelIndex) + 10);
+    } else if (btn == SVC_BTN_RESET) {
+      svcSetThresholdByIndex(editingLevelIndex, svcGetThresholdByIndex(editingLevelIndex) - 10);
+    } else if (btn == SVC_BTN_START) {
+      uiState = UI_MQ3_MENU;
+    }
+    svcRedrawNow();
+    return;
+  }
+
+  if (uiState == UI_MQ3_MENU) {
+    if (btn == SVC_BTN_TEST) {
+      mq3SubIndex--;
+      if (mq3SubIndex < 0) mq3SubIndex = MQ3_SUB_COUNT - 1;
+    } else if (btn == SVC_BTN_RESET) {
+      mq3SubIndex++;
+      if (mq3SubIndex >= MQ3_SUB_COUNT) mq3SubIndex = 0;
+    } else if (btn == SVC_BTN_START) {
+      if (mq3SubIndex == MQ3_BACK) {
+        uiState = UI_MENU;
+      } else if (mq3SubIndex == MQ3_ENABLE) {
+        uiState = UI_EDIT_BOOL;
+      } else if (mq3SubIndex == MQ3_WARMUP) {
+        uiState = UI_EDIT_WARMUP;
+      } else {
+        editingLevelIndex = mq3SubIndex - 1;
+        uiState = UI_EDIT_THRESHOLD;
+      }
+    }
+    svcRedrawNow();
+    return;
+  }
+
+  if (btn == SVC_BTN_TEST) {
+    menuIndex--;
+    if (menuIndex < 0) menuIndex = SCR_COUNT - 1;
+  } else if (btn == SVC_BTN_RESET) {
+    menuIndex++;
+    if (menuIndex >= SCR_COUNT) menuIndex = 0;
+  } else if (btn == SVC_BTN_START) {
+    if (menuIndex == SCR_EXIT) {
+      serviceModeExit();
+      return;
+    }
+    if (menuIndex == SCR_MQ3_ROOT) {
+      uiState = UI_MQ3_MENU;
+      mq3SubIndex = 0;
+    } else {
+      svcToggleCurrentMenuBool();
+    }
+  }
+  svcRedrawNow();
+}
+
+static void serviceModeLoop() {
+  svcDrawDisplay();
+  displayDirty = false;
+
+  while (serviceActive) {
+
+    int btn = 0;
+
+    if (svcReadButtonPressed(svcPinTest, svcLastTest)) {
+      btn = SVC_BTN_TEST;
+    } else if (svcReadButtonPressed(svcPinReset, svcLastReset)) {
+      btn = SVC_BTN_RESET;
+    } else if (svcReadButtonPressed(svcPinStart, svcLastStart)) {
+      btn = SVC_BTN_START;
+    }
+
+    if (btn != 0) {
+      svcOnMenuButton(btn);
+      if (!serviceActive) {
+        return;
+      }
+      delay(150);
+    } else if (displayDirty) {
+      svcRedrawNow();
+    }
+
+    delay(20);
+  }
+}
+
+// =============================================================================
+// ОСНОВНОЙ ПРОЕКТ — setup / loop
+// =============================================================================
+
+void setup() {
+
+  Serial.begin(9600);
+
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(irPin, INPUT);
+
+  pinMode(buzzer, OUTPUT);
+  pinMode(engineRelay, OUTPUT);
+
+  pinMode(led1, OUTPUT);
+  pinMode(led2, OUTPUT);
+  pinMode(led3, OUTPUT);
+  pinMode(led4, OUTPUT);
+  pinMode(led5, OUTPUT);
+  pinMode(led6, OUTPUT);
+
+  pinMode(testButton, INPUT_PULLUP);
+  pinMode(resetButton, INPUT_PULLUP);
+  pinMode(startButton, INPUT_PULLUP);
+
+  serviceModeBindHardware(
+    &lcd,
+    testButton, resetButton, startButton,
+    engineRelay, irPin, buzzer, mq3Pin,
+    led1, led2, led3, led4, led5, led6
+  );
+
+  allOff();
+
+  digitalWrite(engineRelay, LOW);
+  digitalWrite(buzzer, LOW);
+
+  lcd.setCursor(0, 0);
+  lcd.print("Driver System");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Starting...");
+
+  delay(2000);
+
+  systemTest();
+  warmupMQ3();
+  waitTestButton();
+  alcoholCheck();
+}
+
+void loop() {
+
+  if (digitalRead(resetButton) == LOW) {
+    resetSystem();
+  }
+
+  handleStartStop();
+
+  if (!engineRunning) {
+    delay(100);
+    return;
+  }
+
+  int alcoholValue = 0;
+
+  if (svcMq3Enabled) {
+    alcoholValue = analogRead(mq3Pin);
+
+    Serial.print("MQ3: ");
+    Serial.println(alcoholValue);
+
+    showAlcoholLevel(alcoholValue);
+  }
+
+  if (svcIrEnabled) {
+
+    int eyeState = digitalRead(irPin);
+
+    if (eyeState == HIGH) {
+
+      if (!sleepDetected) {
+
+        sleepDetected = true;
+        sleepStart = millis();
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Driver Sleep");
+        lcd.setCursor(0, 1);
+        lcd.print("Wake Up!");
+
+        if (svcBuzzerEnabled) {
+          digitalWrite(buzzer, HIGH);
+        }
+      }
+
+      runningAlarm();
+
+      if (millis() - sleepStart >= sleepOffTime) {
+        emergencyShutdown("SLEEP");
+      }
+
+    } else {
+
+      if (sleepDetected) {
+
+        sleepDetected = false;
+        digitalWrite(buzzer, LOW);
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Driver Awake");
+
+        delay(1500);
+      }
+    }
+  }
+
+  if (svcMq3Enabled && alcoholValue >= alcoholLimit) {
+
+    if (!alcoholDetected) {
+
+      alcoholDetected = true;
+      alcoholStart = millis();
+
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Alcohol Alert");
+      lcd.setCursor(0, 1);
+      lcd.print("Stop Vehicle");
+
+      if (svcBuzzerEnabled) {
+        digitalWrite(buzzer, HIGH);
+      }
+    }
+
+    runningAlarm();
+
+    if (millis() - alcoholStart >= alcoholOffTime) {
+      emergencyShutdown("ALCOHOL");
+    }
+
+  } else {
+
+    if (alcoholDetected) {
+
+      alcoholDetected = false;
+      digitalWrite(buzzer, LOW);
+
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Alcohol Clear");
+
+      delay(1500);
+    }
+  }
+
+  delay(100);
+}
+
+// =============================================================================
+// ОСНОВНОЙ ПРОЕКТ — функции
+// =============================================================================
+
+void runningAlarm() {
+
+  if (!svcLedEnabled && !svcBuzzerEnabled) {
+    return;
+  }
+
+  if (svcLedEnabled) {
+    digitalWrite(led1, HIGH);
+    delay(80);
+    digitalWrite(led1, LOW);
+
+    digitalWrite(led2, HIGH);
+    delay(80);
+    digitalWrite(led2, LOW);
+
+    digitalWrite(led3, HIGH);
+    delay(80);
+    digitalWrite(led3, LOW);
+
+    digitalWrite(led4, HIGH);
+    delay(80);
+    digitalWrite(led4, LOW);
+
+    digitalWrite(led5, HIGH);
+    delay(80);
+    digitalWrite(led5, LOW);
+
+    digitalWrite(led6, HIGH);
+    delay(80);
+    digitalWrite(led6, LOW);
+  }
+
+  if (svcBuzzerEnabled) {
+    digitalWrite(buzzer, HIGH);
+    delay(80);
+    digitalWrite(buzzer, LOW);
+  }
+}
+
+void emergencyShutdown(String reason) {
+
+  digitalWrite(engineRelay, LOW);
+
+  engineRunning = false;
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("ENGINE OFF");
+
+  lcd.setCursor(0, 1);
+  lcd.print(reason);
+
+  while (1) {
+
+    if (digitalRead(resetButton) == LOW) {
+      resetSystem();
+      return;
+    }
+
+    digitalWrite(led5, HIGH);
+    digitalWrite(led6, HIGH);
+
+    digitalWrite(buzzer, HIGH);
+
+    delay(250);
+
+    digitalWrite(led5, LOW);
+    digitalWrite(led6, LOW);
+
+    digitalWrite(buzzer, LOW);
+
+    delay(250);
+  }
+}
+
+void systemTest() {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("SYSTEM TEST");
+
+  lcd.setCursor(0, 1);
+  lcd.print("ALL DEVICES");
+
+  digitalWrite(led1, HIGH);
+  digitalWrite(led2, HIGH);
+  digitalWrite(led3, HIGH);
+  digitalWrite(led4, HIGH);
+  digitalWrite(led5, HIGH);
+  digitalWrite(led6, HIGH);
+
+  digitalWrite(buzzer, HIGH);
+  digitalWrite(engineRelay, HIGH);
+
+  delay(5000);
+
+  allOff();
+
+  digitalWrite(buzzer, LOW);
+  digitalWrite(engineRelay, LOW);
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("TEST COMPLETE");
+
+  delay(2000);
+}
+
+void warmupMQ3() {
+
+  unsigned long startMs = millis();
+  unsigned long lastBlinkMs = 0;
+  bool blinkOn = false;
+  int lastShownSec = -1;
+
+  while (millis() - startMs < mqWarmupTime) {
+
+    unsigned long elapsed = millis() - startMs;
+    unsigned long elapsedBeforeService = elapsed;
+
+    if (serviceModePollWarmupEntry(elapsed, mqWarmupTime)) {
+      startMs = millis() - elapsedBeforeService;
+      elapsed = elapsedBeforeService;
+    }
+
+    int sec = (int)((mqWarmupTime - elapsed) / 1000);
+
+    if (sec != lastShownSec) {
+      lastShownSec = sec;
+
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("MQ3 Warmup");
+      lcd.setCursor(0, 1);
+      lcd.print(sec);
+      lcd.print(" sec");
+    }
+
+    if (millis() - lastBlinkMs >= 500) {
+      lastBlinkMs = millis();
+      blinkOn = !blinkOn;
+      digitalWrite(led3, blinkOn ? HIGH : LOW);
+      digitalWrite(led4, blinkOn ? HIGH : LOW);
+    }
+
+    delay(20);
+  }
+
+  digitalWrite(led3, LOW);
+  digitalWrite(led4, LOW);
+}
+
+void waitTestButton() {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Press TEST");
+
+  lcd.setCursor(0, 1);
+  lcd.print("For Alcohol");
+
+  while (digitalRead(testButton) == HIGH) {
+
+    digitalWrite(led1, HIGH);
+    digitalWrite(led2, HIGH);
+
+    delay(400);
+
+    digitalWrite(led1, LOW);
+    digitalWrite(led2, LOW);
+
+    delay(400);
+  }
+
+  delay(300);
+}
+
+void alcoholCheck() {
+
+  if (!svcMq3Enabled) {
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("MQ3 DISABLED");
+    lcd.setCursor(0, 1);
+    lcd.print("Press START");
+
+    return;
+  }
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Blow Sensor");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Checking");
+
+  delay(5000);
+
+  int alcoholValue = analogRead(mq3Pin);
+
+  Serial.print("RESULT: ");
+  Serial.println(alcoholValue);
+
+  showAlcoholLevel(alcoholValue);
+
+  if (alcoholValue >= alcoholLimit) {
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("ACCESS DENIED");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Press RESET");
+
+    while (1) {
+
+      if (digitalRead(resetButton) == LOW) {
+        resetSystem();
+        return;
+      }
+
+      digitalWrite(led5, HIGH);
+      digitalWrite(led6, HIGH);
+
+      if (svcBuzzerEnabled) {
+        digitalWrite(buzzer, HIGH);
+      }
+
+      delay(250);
+
+      digitalWrite(led5, LOW);
+      digitalWrite(led6, LOW);
+
+      digitalWrite(buzzer, LOW);
+
+      delay(250);
+    }
+
+  } else {
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("ACCESS OK");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Press START");
+
+    delay(2000);
+  }
+}
+
+void showAlcoholLevel(int value) {
+
+  allOff();
+
+  if (!svcLedEnabled) {
+    return;
+  }
+
+  if (value > 0) digitalWrite(led1, HIGH);
+  if (value >= level1) digitalWrite(led2, HIGH);
+  if (value >= level2) digitalWrite(led3, HIGH);
+  if (value >= level3) digitalWrite(led4, HIGH);
+  if (value >= level4) digitalWrite(led5, HIGH);
+  if (value >= level5) digitalWrite(led6, HIGH);
+}
+
+void allOff() {
+
+  digitalWrite(led1, LOW);
+  digitalWrite(led2, LOW);
+  digitalWrite(led3, LOW);
+  digitalWrite(led4, LOW);
+  digitalWrite(led5, LOW);
+  digitalWrite(led6, LOW);
+}
+
+void resetSystem() {
+
+  allOff();
+
+  digitalWrite(engineRelay, LOW);
+  digitalWrite(buzzer, LOW);
+
+  sleepDetected = false;
+  alcoholDetected = false;
+
+  engineRunning = false;
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("RESET SYSTEM");
+
+  delay(2000);
+
+  warmupMQ3();
+  waitTestButton();
+  alcoholCheck();
+}
+
+void handleStartStop() {
+
+  bool currentButton = digitalRead(startButton);
+
+  if (lastStartButtonState == HIGH && currentButton == LOW) {
+
+    engineRunning = !engineRunning;
+
+    delay(200);
+
+    if (engineRunning) {
+
+      digitalWrite(engineRelay, HIGH);
+
+      lcd.clear();
+
+      lcd.setCursor(0, 0);
+      lcd.print("ENGINE START");
+
+      lcd.setCursor(0, 1);
+      lcd.print("Monitoring");
+
+    } else {
+
+      digitalWrite(engineRelay, LOW);
+
+      allOff();
+
+      digitalWrite(buzzer, LOW);
+
+      lcd.clear();
+
+      lcd.setCursor(0, 0);
+      lcd.print("ENGINE STOP");
+    }
+  }
+
+  lastStartButtonState = currentButton;
+}
